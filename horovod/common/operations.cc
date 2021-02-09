@@ -111,6 +111,7 @@ namespace common {
 namespace {
 
 // All the Horovod state that must be stored globally per-process.
+// 这是一个全局变量，就是horovod的一些全局状态，需要每个进程都可以读取的到。
 HorovodGlobalState horovod_global;
 
 #if HAVE_MPI
@@ -138,7 +139,7 @@ CCLContext ccl_context;
 #endif
 
 std::unique_ptr<OperationManager> op_manager;
-
+// 这个operation manager是用来管理最终allreduce，allgather等op是有MPI还是NCCL来完成
 OperationManager* CreateOperationManager(HorovodGlobalState& state) {
   // Order of these operations is very important. Operations will be checked
   // sequentially from the first to the last. The first 'Enabled' operation will
@@ -367,11 +368,21 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   // Initialize mpi context
 #if HAVE_DDL
   // If DDL is enabled, let DDL ops manage MPI environment.
+  // 不是很清楚这个DDL是干嘛的
   auto mpi_ctx_manager = DDL_MPIContextManager(ddl_context, gpu_context);
 #else
   // Otherwise, let MPI ops be in charge.
   auto mpi_ctx_manager = MPIContextManager();
 #endif
+  // 初始化mpi_context，这个是mpi上下文相关的内容
+  LOG(DEBUG) << "horovod_rank() is " << horovod_rank(); //这里通过horovod_rank获取到rank为-1
+  // 因为整个线程初始化还没完成
+  if(0 == horovod_rank()){
+    LOG(DEBUG) << "before state.controller initialize, state.controller->GetRanks() is " << 
+      state.controller->GetRanks().size();
+  }
+  // 下面是对MPI的上下文环境进行初始化了，可以获得各种功能的通信子，以及做allreduce的通信op，
+  // 同时也可以获取得到进程所在的rank和local_rank结果
   mpi_context.Initialize(state.controller->GetRanks(), mpi_ctx_manager);
 #endif
 
@@ -388,8 +399,10 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
     }
 #endif
   // Initialize controller
+  // 下面是controller的初始化，这个需要重点看
   state.controller->Initialize();
-
+  LOG(DEBUG) << "after controller initialized, state.controller->GetRanks().size() is " <<
+    state.controller->GetRanks().size();
   bool is_coordinator = state.controller->IsCoordinator();
   bool is_homogeneous = state.controller->IsHomogeneous();
   int size = state.controller->GetSize();
@@ -648,24 +661,29 @@ bool RunLoopOnce(HorovodGlobalState& state) {
 
 // Start Horovod background thread. Ensure that this is
 // only done once no matter how many times this function is called.
+// 这个主要初始化一个后台线程，这个后台线程至关重要
 void InitializeHorovodOnce(const int* ranks, int nranks) {
   // Ensure background thread is only started once.
   if (!horovod_global.initialize_flag.test_and_set()) {
     horovod_global.control_operation = ParseControllerOpsFromEnv();
     horovod_global.cpu_operation = ParseCPUOpsFromEnv();
-#if HAVE_MPI
+#if HAVE_MPI   
+    LOG(DEBUG) << "now we will use mpi";    
     // Enable mpi is it's used either in cpu data transfer or controller
     if (horovod_global.cpu_operation == LibType::MPI ||
         horovod_global.control_operation == LibType::MPI) {
+        // 这个mpi_context应该是mpi环境相关得到控制器
       mpi_context.Enable();
     }
 
     if (horovod_global.control_operation == LibType::MPI){
+        // 将controller设定为MPI控制器
       horovod_global.controller.reset(new MPIController(
           horovod_global.response_cache,
           horovod_global.tensor_queue, horovod_global.timeline,
           horovod_global.parameter_manager, horovod_global.group_table,
           mpi_context));
+      LOG(DEBUG) << "nranks is " << nranks;
       horovod_global.controller->SetRanks(ranks, nranks);
     }
 #endif
@@ -687,6 +705,7 @@ void InitializeHorovodOnce(const int* ranks, int nranks) {
 #endif
     // Reset initialization flag
     horovod_global.initialization_done = false;
+    // 起后台线程需要初始化一大堆的东西
     horovod_global.background_thread = std::thread(
         BackgroundThreadLoop, std::ref(horovod_global));
   }
@@ -710,6 +729,11 @@ Status CheckInitialized() {
 extern "C" {
 
 void horovod_init(const int* ranks, int nranks) {
+  LOG(DEBUG) << "=================print ranks===============";
+  for(int i = 0; i < nranks; ++i){
+      LOG(DEBUG) << ranks[i] << " ";
+  }
+  LOG(DEBUG) << "=================print ranks===============";
   InitializeHorovodOnce(ranks, nranks);
 }
 
